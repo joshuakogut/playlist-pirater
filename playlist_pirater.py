@@ -8,12 +8,17 @@ Pipeline (see plans.md):
   3. Store everything in a configurable ``music`` directory named
      ``Artist - Title.mp3`` so that a later run can detect that a track has
      already been fetched and skip it.
-  4. Write a stored playlist ``local_<inputfilename>.m3u`` in MPD's native
-     playlist format, so MPD can play the result. The playlist contains
-     *only* tracks from the input CSV and keeps their order. It is written
-     before the first download (containing the CSV tracks that are already
-     in the library) and is then updated after every finished track, so MPD
-     sees it grow while the download is still running.
+  4. Write a stored playlist ``local_<inputfilename>.m3u`` in the widely
+     supported M3U format, so that any media player can play the result.
+     The playlist contains *only* tracks from the input CSV and keeps their
+     order. It is written before the first download (containing the CSV tracks
+     that are already in the library) and is then updated after every finished
+     track, so the playlist grows while the download is still running.
+
+By default the entries are relative to the music directory. That is what
+MPD resolves against its ``music_directory``; players that resolve relative
+entries against the playlist file itself need absolute paths instead, which
+``--absolute-paths`` provides.
 
 Only the artist/title pair is used for matching -- live versions, covers and
 remasters are deliberately ignored, exactly as the plan requires.
@@ -23,7 +28,7 @@ Usage:
     python3 playlist_pirater.py example.csv --music-dir music --dry-run
     python3 playlist_pirater.py example.csv --music-dir music --report report.csv
     python3 playlist_pirater.py example.csv --music-dir music \\
-        --mpd-playlist-dir ~/.mpd/playlists
+        --m3u-playlist-dir ./playlists
 """
 
 from __future__ import annotations
@@ -972,66 +977,72 @@ def write_report(results: list[Result], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MPD playlist output
+# M3U playlist output
 # ---------------------------------------------------------------------------
 
-#: Suffix MPD uses for stored playlists. MPD hard-codes this as
-#: ``PLAYLIST_FILE_SUFFIX`` in ``src/Mapper.hxx`` and only recognises files
-#: with this suffix in its playlist directory.
-MPD_PLAYLIST_SUFFIX = ".m3u"
+#: Suffix of the generated playlist files.
+M3U_PLAYLIST_SUFFIX = ".m3u"
 
 #: Prefix of the generated playlist. The full name is ``local_<inputfilename>``.
-MPD_PLAYLIST_PREFIX = "local_"
+M3U_PLAYLIST_PREFIX = "local_"
 
 
-def mpd_playlist_name(csv_path: Path) -> str:
-    """Return the MPD playlist name for the CSV ``csv_path``.
+def m3u_playlist_name(csv_path: Path) -> str:
+    """Return the playlist name for the CSV ``csv_path``.
 
     The plan asks for a playlist called ``local_$inputfilename``, so
     ``example.csv`` becomes ``local_example.csv``.
 
-    MPD refuses stored playlist names containing ``/`` (and ``\\`` on
-    Windows) or newlines, so those are folded away here.
+    Names containing ``/`` (and ``\\`` on Windows) or newlines are folded away
+    here, because such a name cannot be used as a file name.
     """
-    name = f"{MPD_PLAYLIST_PREFIX}{csv_path.name}"
+    name = f"{M3U_PLAYLIST_PREFIX}{csv_path.name}"
     name = name.replace("/", "_").replace("\\", "_")
     name = "".join(ch for ch in name if ch.isprintable() and ch not in "\r\n")
-    return name.strip() or f"{MPD_PLAYLIST_PREFIX}playlist"
+    return name.strip() or f"{M3U_PLAYLIST_PREFIX}playlist"
 
 
-def mpd_entry_for_path(path: Path, music_root: Path) -> str:
-    """Return the MPD playlist entry for a single file.
+def m3u_entry_for_path(
+    path: Path, music_root: Path, absolute: bool = False
+) -> str:
+    """Return the playlist entry for a single file.
 
-    The entry is a path relative to ``music_root`` -- MPD resolves relative
-    playlist entries against its ``music_directory``. A file outside the music
-    directory falls back to an absolute path, which MPD accepts as well.
+    By default the entry is a path relative to ``music_root``, which is what
+    MPD resolves against its ``music_directory`` and what keeps the playlist
+    portable. A file outside the music directory falls back to an absolute
+    path.
+
+    With ``absolute=True`` the entry is always an absolute path. Players that
+    resolve relative entries against the playlist file instead of against a
+    music directory need this.
     """
     root = music_root.resolve()
     resolved = path.resolve()
+    if absolute:
+        return resolved.as_posix()
     try:
         entry = resolved.relative_to(root).as_posix()
     except ValueError:
         # Outside the music directory: fall back to an absolute path,
-        # which MPD accepts as well.
+        # which every player accepts as well.
         entry = resolved.as_posix()
     if entry.startswith("#"):
-        # MPD treats a line starting with "#" as a comment and would
+        # Players treat a line starting with "#" as a comment and would
         # silently drop the track. An absolute path avoids the clash.
         entry = resolved.as_posix()
     return entry
 
 
-def mpd_playlist_entries(
-    results: list[Result], music_root: Path
+def m3u_playlist_entries(
+    results: list[Result], music_root: Path, absolute: bool = False
 ) -> list[str]:
-    """Return the MPD playlist entries for ``results``.
+    """Return the playlist entries for ``results``.
 
     Every track that is available on disk (freshly downloaded or already
     present) contributes one entry, expressed as a path relative to
-    ``music_root`` -- MPD resolves relative playlist entries against its
-    ``music_directory``. Tracks that could not be fetched have no file and
-    are therefore left out. A track that is listed more than once in the
-    input CSV contributes a single entry.
+    ``music_root`` -- or as an absolute path if ``absolute`` is set. Tracks
+    that could not be fetched have no file and are therefore left out. A track
+    that is listed more than once in the input CSV contributes a single entry.
     """
     entries: list[str] = []
     seen: set[Path] = set()
@@ -1042,16 +1053,16 @@ def mpd_playlist_entries(
         if resolved in seen:
             continue
         seen.add(resolved)
-        entries.append(mpd_entry_for_path(result.path, music_root))
+        entries.append(m3u_entry_for_path(result.path, music_root, absolute))
     return entries
 
 
-class MpdPlaylistWriter:
-    """Writes an MPD playlist that grows while the download is running.
+class M3uPlaylistWriter:
+    """Writes an M3U playlist that grows while the download is running.
 
-    The playlist is rewritten after every change, so a track shows up in MPD
-    as soon as its file has been downloaded instead of only at the very end of
-    the run.
+    The playlist is rewritten after every change, so a track shows up in the
+    playlist as soon as its file has been downloaded instead of only at the
+    very end of the run.
 
     Ordering: the playlist contains *only* tracks of the input CSV and keeps
     their CSV order. Every CSV row owns a slot, the slots are handed out in
@@ -1061,11 +1072,18 @@ class MpdPlaylistWriter:
     added.
     """
 
-    def __init__(self, music_root: Path, playlist_dir: Path, name: str) -> None:
+    def __init__(
+        self,
+        music_root: Path,
+        playlist_dir: Path,
+        name: str,
+        absolute: bool = False,
+    ) -> None:
         self.music_root = music_root.expanduser().resolve()
         self.playlist_dir = playlist_dir.expanduser()
         self.name = name
-        self.target = self.playlist_dir / f"{name}{MPD_PLAYLIST_SUFFIX}"
+        self.absolute = absolute
+        self.target = self.playlist_dir / f"{name}{M3U_PLAYLIST_SUFFIX}"
         # track key -> slot number (the position in the CSV)
         self._slots: dict[str, int] = {}
         # slot number -> the file of that track
@@ -1122,7 +1140,7 @@ class MpdPlaylistWriter:
     def entries(self) -> list[str]:
         """Return the current playlist entries, in playlist order."""
         return [
-            mpd_entry_for_path(self._files[slot], self.music_root)
+            m3u_entry_for_path(self._files[slot], self.music_root, self.absolute)
             for slot in sorted(self._files)
         ]
 
@@ -1131,8 +1149,8 @@ class MpdPlaylistWriter:
     def write(self) -> Path:
         """Write the playlist to disk and return its path.
 
-        The file is replaced atomically so that MPD never reads a partially
-        written playlist.
+        The file is replaced atomically so that no player ever reads a
+        partially written playlist.
         """
         self.playlist_dir.mkdir(parents=True, exist_ok=True)
         lines = [f"# {self.name}", *self.entries()]
@@ -1143,7 +1161,7 @@ class MpdPlaylistWriter:
 
 
 def seed_playlist(
-    writer: MpdPlaylistWriter, tracks: Iterable[Track], library: MusicLibrary
+    writer: M3uPlaylistWriter, tracks: Iterable[Track], library: MusicLibrary
 ) -> int:
     """Fill ``writer`` with the files that are already in the library.
 
@@ -1166,20 +1184,25 @@ def seed_playlist(
     return len(writer)
 
 
-def write_mpd_playlist(
-    results: list[Result], music_root: Path, playlist_dir: Path, name: str
+def write_m3u_playlist(
+    results: list[Result],
+    music_root: Path,
+    playlist_dir: Path,
+    name: str,
+    absolute: bool = False,
 ) -> Path:
-    """Write an MPD-readable playlist and return its path.
+    """Write a playlist and return its path.
 
-    The file is written in MPD's native playlist format: UTF-8 text with one
-    song path per line, relative to the music directory. Blank lines and
-    lines starting with ``#`` are comments and are ignored by MPD.
+    The file is written in the M3U format: UTF-8 text with one song path per
+    line, relative to the music directory (or absolute if ``absolute`` is
+    set). Blank lines and lines starting with ``#`` are comments and are
+    ignored by the players.
     """
     playlist_dir = playlist_dir.expanduser()
     playlist_dir.mkdir(parents=True, exist_ok=True)
-    target = playlist_dir / f"{name}{MPD_PLAYLIST_SUFFIX}"
+    target = playlist_dir / f"{name}{M3U_PLAYLIST_SUFFIX}"
 
-    entries = mpd_playlist_entries(results, music_root)
+    entries = m3u_playlist_entries(results, music_root, absolute)
     lines = [f"# {name}", *entries]
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return target
@@ -1221,18 +1244,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="max candidates to fetch full metadata for (default: 8)",
     )
     parser.add_argument(
-        "--mpd-playlist-dir",
+        "--m3u-playlist-dir",
         type=Path,
         default=Path(
-            os.environ.get("PLAYLIST_PIRATER_MPD_PLAYLIST_DIR", "playlists")
+            os.environ.get("PLAYLIST_PIRATER_M3U_PLAYLIST_DIR", "playlists")
         ),
-        help="directory for the generated MPD playlist (default: ./playlists). "
-        "Point this at MPD's playlist_directory.",
+        help="directory for the generated M3U playlist (default: ./playlists). "
+        "Point this at the playlist directory of your player.",
     )
     parser.add_argument(
-        "--no-mpd-playlist",
+        "--no-m3u-playlist",
         action="store_true",
-        help="do not write an MPD playlist",
+        help="do not write an M3U playlist",
+    )
+    parser.add_argument(
+        "--absolute-paths",
+        action="store_true",
+        help="write absolute paths into the playlist instead of paths relative "
+        "to the music directory (needed by players that resolve relative "
+        "entries against the playlist file itself)",
     )
     parser.add_argument(
         "--report",
@@ -1294,13 +1324,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     status = StatusLine(sys.stderr)
     status_fn = status.update if not args.quiet else None
 
-    # -- the MPD playlist ---------------------------------------------------
+    # -- the M3U playlist ---------------------------------------------------
     # It is written before the download starts and after every finished
-    # track, so MPD sees the playlist grow while it is being filled.
-    writer: Optional[MpdPlaylistWriter] = None
-    if not args.no_mpd_playlist and not args.dry_run:
-        name = mpd_playlist_name(args.csv)
-        writer = MpdPlaylistWriter(library.root, args.mpd_playlist_dir, name)
+    # track, so the playlist grows while it is being filled.
+    writer: Optional[M3uPlaylistWriter] = None
+    if not args.no_m3u_playlist and not args.dry_run:
+        name = m3u_playlist_name(args.csv)
+        writer = M3uPlaylistWriter(
+            library.root, args.m3u_playlist_dir, name, absolute=args.absolute_paths
+        )
         # The rows of the CSV define the slots and therefore the order of
         # the playlist.
         writer.set_tracks(tracks)
@@ -1340,7 +1372,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         seeded = seed_playlist(writer, tracks, library)
         writer.write()
         print(
-            f"MPD playlist: {seeded} existing track(s) -> {writer.target}",
+            f"M3U playlist: {seeded} existing track(s) -> {writer.target}",
             flush=True,
         )
 
@@ -1363,7 +1395,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if writer is not None:
         print(
-            f"MPD playlist written to {writer.target} "
+            f"M3U playlist written to {writer.target} "
             f"({len(writer)} track(s))"
         )
 

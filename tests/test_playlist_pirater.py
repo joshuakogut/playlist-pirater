@@ -670,12 +670,12 @@ class ReportTests(unittest.TestCase):
         self.assertIn("downloaded", content)
 
 
-class MpdPlaylistTests(unittest.TestCase):
+class M3uPlaylistTests(unittest.TestCase):
     def test_playlist_name_uses_local_prefix(self):
-        self.assertEqual(pp.mpd_playlist_name(Path("example.csv")), "local_example.csv")
+        self.assertEqual(pp.m3u_playlist_name(Path("example.csv")), "local_example.csv")
 
     def test_playlist_name_is_sanitised(self):
-        name = pp.mpd_playlist_name(Path("a/b.csv"))
+        name = pp.m3u_playlist_name(Path("a/b.csv"))
         self.assertNotIn("/", name)
         self.assertTrue(name.startswith("local_"))
 
@@ -688,8 +688,23 @@ class MpdPlaylistTests(unittest.TestCase):
             path.write_bytes(b"x")
             results = [pp.Result(track, "downloaded", "ok", path=path)]
             self.assertEqual(
-                pp.mpd_playlist_entries(results, root), ["A - B.mp3"]
+                pp.m3u_playlist_entries(results, root), ["A - B.mp3"]
             )
+
+    def test_entries_can_be_absolute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "music"
+            root.mkdir()
+            track = pp.Track(artist="A", title="B")
+            path = root / "A - B.mp3"
+            path.write_bytes(b"x")
+            results = [pp.Result(track, "downloaded", "ok", path=path)]
+
+            entries = pp.m3u_playlist_entries(results, root, absolute=True)
+
+            self.assertEqual(len(entries), 1)
+            self.assertTrue(Path(entries[0]).is_absolute())
+            self.assertTrue(Path(entries[0]).is_file())
 
     def test_entries_exclude_failed_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -700,7 +715,7 @@ class MpdPlaylistTests(unittest.TestCase):
                 pp.Result(track, "not-found", "no match"),
                 pp.Result(track, "error", "boom"),
             ]
-            self.assertEqual(pp.mpd_playlist_entries(results, root), [])
+            self.assertEqual(pp.m3u_playlist_entries(results, root), [])
 
     def test_entries_include_skipped_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -710,10 +725,10 @@ class MpdPlaylistTests(unittest.TestCase):
             path = root / "A - B.mp3"
             path.write_bytes(b"x")
             results = [pp.Result(track, "skipped", "already downloaded", path=path)]
-            self.assertEqual(pp.mpd_playlist_entries(results, root), ["A - B.mp3"])
+            self.assertEqual(pp.m3u_playlist_entries(results, root), ["A - B.mp3"])
 
     def test_entry_starting_with_hash_is_not_treated_as_comment(self):
-        """A leading "#" would make MPD skip the line, so avoid it."""
+        """A leading "#" would make a player skip the line, so avoid it."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "music"
             root.mkdir()
@@ -721,7 +736,7 @@ class MpdPlaylistTests(unittest.TestCase):
             path.write_bytes(b"x")
             track = pp.Track(artist="#1", title="Song")
             results = [pp.Result(track, "downloaded", "ok", path=path)]
-            entries = pp.mpd_playlist_entries(results, root)
+            entries = pp.m3u_playlist_entries(results, root)
             self.assertEqual(len(entries), 1)
             self.assertFalse(entries[0].startswith("#"))
             self.assertTrue(Path(entries[0]).is_file())
@@ -736,7 +751,7 @@ class MpdPlaylistTests(unittest.TestCase):
             track = pp.Track(artist="A", title="B")
             results = [pp.Result(track, "downloaded", "ok", path=path)]
 
-            target = pp.write_mpd_playlist(
+            target = pp.write_m3u_playlist(
                 results, root, playlist_dir, "local_example.csv"
             )
 
@@ -744,11 +759,34 @@ class MpdPlaylistTests(unittest.TestCase):
             self.assertTrue(target.is_file())
             lines = target.read_text(encoding="utf-8").splitlines()
             self.assertIn("A - B.mp3", lines)
-            # Comments are ignored by MPD.
+            # Comments are ignored by the players.
             self.assertTrue(lines[0].startswith("#"))
 
-    def test_written_playlist_parses_like_mpd(self):
-        """The file must follow the rules of MPD's own playlist reader."""
+    def test_writer_can_write_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "music"
+            root.mkdir()
+            track = pp.Track(artist="A", title="B")
+            path = root / "A - B.mp3"
+            path.write_bytes(b"x")
+            writer = pp.M3uPlaylistWriter(
+                root, Path(tmp) / "playlists", "local_test.csv", absolute=True
+            )
+            writer.set_tracks([track])
+            writer.add_track(track, path)
+
+            target = writer.write()
+            lines = [
+                line
+                for line in target.read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            ]
+
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(Path(lines[0]).is_absolute())
+
+    def test_written_playlist_parses_like_a_player(self):
+        """The file must follow the rules of a common M3U reader."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "music"
             root.mkdir()
@@ -757,13 +795,13 @@ class MpdPlaylistTests(unittest.TestCase):
             path.write_bytes(b"x")
             track = pp.Track(artist="A", title="B")
             results = [pp.Result(track, "downloaded", "ok", path=path)]
-            target = pp.write_mpd_playlist(
+            target = pp.write_m3u_playlist(
                 results, root, playlist_dir, "local_example.csv"
             )
 
             entries = []
             for line in target.read_text(encoding="utf-8").splitlines():
-                # MPD skips empty lines and comments.
+                # Players skip empty lines and comments.
                 if not line or line.startswith("#"):
                     continue
                 entries.append(line)
@@ -785,7 +823,7 @@ class LivePlaylistTests(unittest.TestCase):
         self.playlists = self.root / "playlists"
 
     def _writer(self, tracks=()):
-        writer = pp.MpdPlaylistWriter(self.music, self.playlists, "local_test.csv")
+        writer = pp.M3uPlaylistWriter(self.music, self.playlists, "local_test.csv")
         writer.set_tracks(tracks)
         return writer
 
@@ -891,7 +929,7 @@ class SeedPlaylistTests(unittest.TestCase):
         self.music.mkdir()
 
     def _seed(self, tracks):
-        writer = pp.MpdPlaylistWriter(
+        writer = pp.M3uPlaylistWriter(
             self.music, Path(self.tmp.name) / "playlists", "local_test.csv"
         )
         library = pp.MusicLibrary(self.music)
@@ -1059,6 +1097,21 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 pp.main(["--help"])
         self.assertEqual(ctx.exception.code, 0)
+
+    def test_absolute_paths_flag_is_parsed(self):
+        args = pp.build_parser().parse_args(["a.csv", "--absolute-paths"])
+        self.assertTrue(args.absolute_paths)
+
+    def test_absolute_paths_flag_is_off_by_default(self):
+        args = pp.build_parser().parse_args(["a.csv"])
+        self.assertFalse(args.absolute_paths)
+
+    def test_playlist_dir_flag_is_parsed(self):
+        args = pp.build_parser().parse_args(
+            ["a.csv", "--m3u-playlist-dir", "/tmp/pl", "--no-m3u-playlist"]
+        )
+        self.assertEqual(args.m3u_playlist_dir, Path("/tmp/pl"))
+        self.assertTrue(args.no_m3u_playlist)
 
 
 if __name__ == "__main__":

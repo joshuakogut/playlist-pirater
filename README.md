@@ -8,8 +8,8 @@ Turns a playlist CSV into a local MP3 library using YouTube Music.
    audio available, transcoded to MP3.
 3. **Store it in a configurable `music` directory** as `Artist - Title.mp3`, so
    that a later run can tell that a track was already fetched and skip it.
-4. **Write an MPD playlist** named `local_<inputfilename>.m3u` that
-   [MPD](https://www.musicpd.org/) can read. The playlist is written *before*
+4. **Write an M3U playlist** named `local_<inputfilename>.m3u` that
+   any media player can read. The playlist is written *before*
    the download starts — containing every audio file that is already in the
    library — and is then updated after every finished track, so it grows
    while the download is still running.
@@ -73,8 +73,9 @@ Use `--quiet` to suppress both.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--music-dir` | `./music` | Destination directory for the MP3s. Also settable via the `PLAYLIST_PIRATER_MUSIC_DIR` environment variable. |
-| `--mpd-playlist-dir` | `./playlists` | Where the generated MPD playlist is written. Point this at MPD's `playlist_directory`. Also settable via the `PLAYLIST_PIRATER_MPD_PLAYLIST_DIR` environment variable. |
-| `--no-mpd-playlist` | off | Do not write an MPD playlist. |
+| `--m3u-playlist-dir` | `./playlists` | Where the generated M3U playlist is written. Also settable via the `PLAYLIST_PIRATER_M3U_PLAYLIST_DIR` environment variable. |
+| `--no-m3u-playlist` | off | Do not write an M3U playlist. |
+| `--absolute-paths` | off | Write absolute paths into the playlist instead of paths relative to the music directory. Needed by players that resolve relative entries against the playlist file itself. |
 | `--quality` | `320` | MP3 bitrate in kbps (`320`, `256`, `192`, `128`, `96`). |
 | `--search-limit` | `10` | Max YouTube Music search results considered per track. |
 | `--metadata-limit` | `8` | Max candidates that get their full metadata fetched. |
@@ -89,16 +90,16 @@ Use `--quiet` to suppress both.
 Exit code is `0` when no errors occurred, `1` when one or more tracks failed,
 and `2` for usage problems (missing/invalid CSV).
 
-## MPD playlist
+## M3U playlist
 
-Every run also writes a playlist that [MPD](https://www.musicpd.org/) can read.
-The playlist is named `local_<inputfilename>.m3u` — for `example.csv` that is
+Every run also writes a playlist in the widely supported M3U format, so that
+any media player can read it. The playlist is named
+`local_<inputfilename>.m3u` — for `example.csv` that is
 `local_example.csv.m3u`.
 
-The file uses MPD's native playlist format: UTF-8 text, one song per line,
-with the paths relative to the music directory (which is what MPD's own
-playlist writer produces — `playlist_save_absolute_paths` defaults to `false`).
-Lines starting with `#` are comments and are ignored by MPD.
+The file is plain UTF-8 text, one song per line, with the paths relative to
+the music directory. Lines starting with `#` are comments and are ignored by
+the players.
 
 ```
 # local_example.csv
@@ -115,6 +116,30 @@ CSV order. Audio files that happen to be in the music directory but are not
 part of the CSV are never added, and a track that is listed twice in the CSV
 appears only once in the playlist.
 
+### Relative vs. absolute paths
+
+By default the entries are **relative to the music directory** (`--music-dir`).
+This keeps the playlist small and portable, and it is what
+[MPD](https://www.musicpd.org/) resolves against its `music_directory`.
+
+Some players instead resolve relative entries against the directory of the
+playlist file itself. Since the playlist usually lives in a different
+directory than the music, such a player would not find the files. For those,
+pass `--absolute-paths`:
+
+```bash
+python3 playlist_pirater.py example.csv \
+    --music-dir /home/joshua/projects/playlist-pirater/music \
+    --m3u-playlist-dir /home/joshua/projects/playlist-pirater/playlists \
+    --absolute-paths
+```
+
+```
+# local_example.csv
+/home/joshua/projects/playlist-pirater/music/Dance Gavin Dance - Ember.mp3
+/home/joshua/projects/playlist-pirater/music/Circa Survive - Get Out.mp3
+```
+
 ### The playlist grows while downloading
 
 The playlist is not written once at the end — it is built up live:
@@ -123,24 +148,30 @@ The playlist is not written once at the end — it is built up live:
    in the music directory is written into the playlist, at its CSV position.
 2. **After every finished track**, the track is added to the playlist and the
    file is rewritten immediately. The rewrite is atomic (write to a temp file,
-   then `os.replace`), so MPD never sees a half-written playlist.
+   then `os.replace`), so a player never sees a half-written playlist.
 
-This means you can hit `load` in MPD right after starting the script and
-already play the first tracks while the rest is still downloading.
+This means you can open the playlist in your player right after starting the
+script and already play the first tracks while the rest is still downloading.
 
-To use it, point `--mpd-playlist-dir` at your MPD `playlist_directory` and
-make sure MPD's `music_directory` matches `--music-dir`:
+By default the playlist is written to `./playlists`; use `--m3u-playlist-dir`
+to put it somewhere else:
+
+```bash
+python3 playlist_pirater.py example.csv \
+    --music-dir /home/joshua/projects/playlist-pirater/music \
+    --m3u-playlist-dir /home/joshua/projects/playlist-pirater/playlists
+```
+
+### Using it with MPD
+
+[MPD](https://www.musicpd.org/) reads M3U playlists from its
+`playlist_directory`. Point `--m3u-playlist-dir` at that directory and make
+sure MPD's `music_directory` matches `--music-dir`:
 
 ```ini
 # ~/.config/mpd/mpd.conf
 music_directory    "/home/joshua/projects/playlist-pirater/music"
 playlist_directory "/home/joshua/projects/playlist-pirater/playlists"
-```
-
-```bash
-python3 playlist_pirater.py example.csv \
-    --music-dir /home/joshua/projects/playlist-pirater/music \
-    --mpd-playlist-dir /home/joshua/projects/playlist-pirater/playlists
 ```
 
 The playlist then shows up in any MPD client, e.g.:
@@ -150,6 +181,12 @@ $ mpc lsplaylists
 local_example.csv
 $ mpc load local_example.csv
 ```
+
+## Playing it with MPD
+
+The sections below are a setup guide for using
+[MPD](https://www.musicpd.org/) as the player. They are not required — the
+generated `.m3u` works with any media player.
 
 ### Running MPD as your own user
 
