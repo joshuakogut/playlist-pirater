@@ -14,6 +14,12 @@ Pipeline (see plans.md):
      order. It is written before the first download (containing the CSV tracks
      that are already in the library) and is then updated after every finished
      track, so the playlist grows while the download is still running.
+   5. Tag the MP3 with the ID3 metadata of the CSV row (artist, title,
+      album, album artist, track/disc number) using ffmpeg as a stream copy
+      -- the audio is never re-encoded and cover art survives. Track numbers
+      are recomputed inside each album, because the CSV ``position`` column
+      is the order of the playlist rather than the order of the album.
+      ``--tag-only`` tags files already in the library without any network.
 
 By default the entries are relative to the music directory. That is what
 MPD resolves against its ``music_directory``; players that resolve relative
@@ -29,15 +35,18 @@ Usage:
     python3 playlist_pirater.py example.csv --music-dir music --report report.csv
     python3 playlist_pirater.py example.csv --music-dir music \\
         --m3u-playlist-dir ./playlists
+    python3 playlist_pirater.py example.csv --music-dir music --tag-only
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -128,6 +137,8 @@ class Track:
     album: str = ""
     position: int = 0
     row: int = 0
+    #: Optional release year/date from the CSV; empty when the CSV has none.
+    date: str = ""
 
     @property
     def key(self) -> str:
@@ -456,6 +467,15 @@ def load_tracks(csv_path: Path) -> list[Track]:
                     album=_pick(row, "album", "album name").strip(),
                     position=position,
                     row=index,
+                    date=_pick(
+                        row,
+                        "year",
+                        "date",
+                        "release year",
+                        "release_year",
+                        "release date",
+                        "album release year",
+                    ).strip(),
                 )
             )
     return tracks
@@ -536,6 +556,327 @@ class MusicLibrary:
 
     def register(self, track: Track, path: Path) -> None:
         self._index[track.key] = path
+
+
+# ---------------------------------------------------------------------------
+# ID3 metadata (written with ffmpeg, without re-encoding)
+# ---------------------------------------------------------------------------
+
+
+class TagError(RuntimeError):
+    """Raised when ffmpeg could not write the tags of a file."""
+
+
+@dataclass
+class TrackTags:
+    """The ID3 frames written onto a downloaded MP3.
+
+    Values are taken straight from the playlist CSV -- no metadata is fetched
+    from the network, so tags can be (re)written for files that were
+    downloaded earlier.
+    """
+
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    #: First artist of the credit, used as ID3 ``album_artist`` (TPE2) so
+    #: that an album stays grouped together in players.
+    album_artist: str = ""
+    #: ``track``/``total`` inside the album, as ID3 ``track`` (TRCK).
+    track: str = ""
+    #: ``disc``/``total``, as ID3 ``disc`` (TPOS).
+    disc: str = ""
+    #: Release year/date, as ID3 ``date`` (TYER/TDRC). Optional.
+    date: str = ""
+
+    def as_metadata(self) -> dict[str, str]:
+        """Return the ``-metadata key=value`` pairs, skipping empty values."""
+        return {
+            key: value
+            for key, value in (
+                ("title", self.title),
+                ("artist", self.artist),
+                ("album", self.album),
+                ("album_artist", self.album_artist),
+                ("track", self.track),
+                ("disc", self.disc),
+                ("date", self.date),
+            )
+            if value
+        }
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.as_metadata()
+
+
+def primary_artist(artist: str) -> str:
+    """Return the main artist of a credit such as ``"A, B"`` -> ``"A"``.
+
+    Credits in the CSV are comma separated collaborators; the first name is
+    the album artist. Used for grouping as well, so an album whose rows carry
+    different collaborators still ends up in one group.
+    """
+    return artist.split(",")[0].strip()
+
+
+def build_tags(tracks: list[Track]) -> dict[str, TrackTags]:
+    """Derive the ID3 tags of every track of the input CSV.
+
+    The playlist ``position`` column is the order of the playlist, not the
+    order of the album, so track numbers are recomputed here: rows are grouped
+    by ``(album, primary artist)`` -- case-insensitively -- and numbered 1..N
+    within the group, in the order the rows appear in the CSV.
+
+    A track listed twice in the CSV (or twice on the same album) is numbered
+    once: the first occurrence defines its tags and every later row with the
+    same key maps to them. Returns a mapping keyed by :attr:`Track.key`, so
+    the tags can be looked up for any row or library file.
+    """
+    tags: dict[str, TrackTags] = {}
+    # (album, primary artist) -> unique tracks of that album, in CSV order
+    groups: dict[tuple[str, str], list[Track]] = {}
+    order: list[tuple[str, str]] = []
+
+    for track in tracks:
+        group_key = (
+            track.album.strip().lower(),
+            primary_artist(track.artist).lower(),
+        )
+        if group_key not in groups:
+            groups[group_key] = []
+            order.append(group_key)
+        group = groups[group_key]
+        if any(existing.key == track.key for existing in group):
+            continue  # duplicate row: it shares the file and the tags
+        group.append(track)
+
+    for group_key in order:
+        group = groups[group_key]
+        album_present = bool(group_key[0])
+        total = len(group)
+        for index, track in enumerate(group, start=1):
+            tags[track.key] = TrackTags(
+                title=track.title,
+                artist=track.artist,
+                album=track.album if album_present else "",
+                album_artist=primary_artist(track.artist),
+                track=f"{index}/{total}" if album_present else "",
+                disc=f"1/1" if album_present else "",
+                date=track.date,
+            )
+
+    # Rows that never reached a group (defensive; every row does) still get
+    # title/artist, so no file is ever left untagged.
+    for track in tracks:
+        tags.setdefault(track.key, TrackTags(title=track.title, artist=track.artist))
+    return tags
+
+
+def resolve_tool(name: str, ffmpeg_location: Optional[str] = None) -> Optional[Path]:
+    """Locate an ffmpeg tool (``ffmpeg``/``ffprobe``).
+
+    ``--ffmpeg-location`` may point either at the binary itself or at a
+    directory holding the binaries (both spellings are accepted by yt-dlp, so
+    the same flag serves the downloader and the tagger). Falls back to PATH;
+    returns ``None`` when nothing is found.
+    """
+    if ffmpeg_location:
+        location = Path(ffmpeg_location).expanduser()
+        if location.is_dir():
+            candidate = location / name
+            if candidate.is_file():
+                return candidate
+            # Windows-style suffix, harmless elsewhere.
+            for suffix in (".exe", ".bat", ".cmd"):
+                if (location / f"{name}{suffix}").is_file():
+                    return location / f"{name}{suffix}"
+        elif location.is_file():
+            return location
+    found = shutil.which(name)
+    return Path(found) if found else None
+
+
+def read_tags(path: Path, ffprobe: Optional[Path] = None) -> dict[str, str]:
+    """Read the ID3 tags of ``path`` with ffprobe.
+
+    Returns ``{}`` when ffprobe is unavailable or cannot read the file, which
+    callers treat as "tags unknown" and simply (re)write them.
+    """
+    ffprobe = ffprobe or resolve_tool("ffprobe")
+    if ffprobe is None:
+        return {}
+    try:
+        completed = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return {}
+    if completed.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except ValueError:
+        return {}
+    tags = payload.get("format", {}).get("tags", {})
+    if not isinstance(tags, dict):
+        return {}
+    # ffprobe reports some frames with both raw and pretty names; normalise
+    # the handful we care about so comparisons are stable.
+    lowered = {str(key).lower(): str(value) for key, value in tags.items()}
+    aliases = {
+        "track": ("track", "trck"),
+        "disc": ("disc", "tpos"),
+        "album_artist": ("album_artist", "albumartist", "tpe2"),
+        "date": ("date", "year", "tyer", "tdrc"),
+    }
+    for canonical, names in aliases.items():
+        for name in names:
+            if name in lowered:
+                lowered[canonical] = lowered[name]
+                break
+    return lowered
+
+
+class TagWriter:
+    """Writes ID3 tags onto an MP3 with ffmpeg, without re-encoding audio.
+
+    The file is remuxed with ``-c copy`` into a temporary file in the same
+    directory and then moved into place, so a failure never damages the
+    original and the rename is atomic. ``ffmpeg -map 0`` keeps every stream,
+    including attached cover art.
+    """
+
+    def __init__(
+        self,
+        ffmpeg_location: Optional[str] = None,
+        status: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.status = status
+        self.prefix = ""
+        self._reporter = make_status_reporter(status)
+        self.ffmpeg = resolve_tool("ffmpeg", ffmpeg_location)
+        self.ffprobe = resolve_tool("ffprobe", ffmpeg_location)
+        #: One warning is enough when ffmpeg is missing; tagging is then off.
+        self._missing_reported = False
+
+    def _report(self, text: str, milestone: bool = False) -> None:
+        self._reporter(f"{self.prefix} {text}".strip(), milestone)
+
+    @property
+    def available(self) -> bool:
+        return self.ffmpeg is not None
+
+    def command(self, source: Path, destination: Path, tags: TrackTags) -> list[str]:
+        """Build the ffmpeg argv. Pure, so tests can assert on it."""
+        assert self.ffmpeg is not None
+        command = [
+            str(self.ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            # Copy *all* input streams (cover art included) and drop the
+            # metadata/chapters yt-dlp left behind before writing ours.
+            "-map",
+            "0",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-c",
+            "copy",
+            # ID3v2.3 is the most widely supported flavour; no ID3v1 block,
+            # which would truncate long/non-ASCII values.
+            "-id3v2_version",
+            "3",
+            "-write_id3v1",
+            "0",
+            # Do not stamp an "encoder" tag onto the remuxed file.
+            "-fflags",
+            "+bitexact",
+        ]
+        # Values are passed as argv entries, never interpolated into a shell
+        # string, so quotes/newlines/unicode in the CSV cannot break anything.
+        for key, value in sorted(tags.as_metadata().items()):
+            command.extend(["-metadata", f"{key}={value}"])
+        command.append(str(destination))
+        return command
+
+    def tag(self, path: Path, tags: TrackTags, force: bool = False) -> bool:
+        """Write ``tags`` onto ``path``.
+
+        Returns ``True`` when the file was rewritten and ``False`` when it
+        already carried the requested tags (or there was nothing to write),
+        so repeated runs are cheap. Raises :class:`TagError` on failure.
+        """
+        if tags.is_empty:
+            return False
+        if self.ffmpeg is None:
+            if not self._missing_reported:
+                self._missing_reported = True
+                self._report("ffmpeg not found; skipping tags", milestone=True)
+            raise TagError("ffmpeg not found")
+
+        if not force and self.ffprobe is not None:
+            current = read_tags(path, self.ffprobe)
+            wanted = tags.as_metadata()
+            if current and all(current.get(k) == v for k, v in wanted.items()):
+                return False  # already tagged correctly
+
+        temporary = path.with_name(f".{path.name}.tagging.mp3")
+        command = self.command(path, temporary, tags)
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            if completed.returncode != 0 or not temporary.exists():
+                detail = (completed.stderr or "").strip().splitlines()
+                raise TagError(
+                    detail[-1] if detail else f"ffmpeg exited {completed.returncode}"
+                )
+            # Keep the permissions of the original file.
+            try:
+                os.chmod(temporary, path.stat().st_mode & 0o7777)
+            except OSError:
+                pass
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+        return True
+
+    def tag_file(self, path: Path, tags: TrackTags) -> str:
+        """Tag ``path`` and report the outcome as a short status word.
+
+        Used by the ``--tag-only`` pass: ``tagged``/``already-tagged``/
+        ``failed``. Unlike :meth:`tag` this never raises, so one broken file
+        does not stop the run.
+        """
+        try:
+            written = self.tag(path, tags)
+        except TagError as exc:
+            self._report(f"{path.name}: {exc}", milestone=True)
+            return "failed"
+        return "tagged" if written else "already-tagged"
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +1157,8 @@ class PlaylistPirater:
         retries: int = 2,
         status: Optional[StatusLine] = None,
         on_ready: Optional[Callable[[Track, Path], None]] = None,
+        tagger: Optional[TagWriter] = None,
+        tag_map: Optional[dict[str, TrackTags]] = None,
     ) -> None:
         self.library = library
         self.finder = finder
@@ -824,6 +1167,8 @@ class PlaylistPirater:
         self.overwrite = overwrite
         self.retries = retries
         self.status = status
+        self.tagger = tagger
+        self.tag_map = tag_map or {}
         #: Called with (track, path) as soon as a track has a file on disk.
         self.on_ready = on_ready
 
@@ -847,7 +1192,7 @@ class PlaylistPirater:
         always says both *what* is happening and *which* track it refers to.
         """
         prefix = f"[{index}/{total}]"
-        for component in (self.finder, self.downloader):
+        for component in (self.finder, self.downloader, self.tagger):
             if component is None:
                 continue
             if hasattr(component, "prefix"):
@@ -858,8 +1203,15 @@ class PlaylistPirater:
             existing = self.library.existing(track)
             if existing is not None:
                 self._report("already downloaded, skipping", milestone=True)
+                # An existing file may predate tagging (or carry stale tags),
+                # so it is topped up here. Writing is skipped when the tags
+                # already match, which makes a plain re-run cheap.
+                failure = self._write_tags(track, existing)
                 self._announce(track, existing)
-                return Result(track, "skipped", "already downloaded", path=existing)
+                message = "already downloaded"
+                if failure:
+                    message = f"{message} ({failure})"
+                return Result(track, "skipped", message, path=existing)
 
         try:
             candidate = self.finder.find(track)
@@ -889,13 +1241,19 @@ class PlaylistPirater:
             try:
                 path = self.downloader.download(candidate, destination)
                 self.library.register(track, path)
+                message = f"{candidate.artist} - {candidate.title}"
+                # Tags are written outside the retry loop: a tagging problem
+                # must never make the audio download again.
+                failure = self._write_tags(track, path)
+                if failure:
+                    message = f"{message} ({failure})"
                 # The playlist is updated right away, so the track can be
                 # played while the rest of the playlist is still downloading.
                 self._announce(track, path)
                 return Result(
                     track,
                     "downloaded",
-                    f"{candidate.artist} - {candidate.title}",
+                    message,
                     path=path,
                     candidate=candidate,
                 )
@@ -907,6 +1265,68 @@ class PlaylistPirater:
         return Result(
             track, "error", f"download failed: {last_error}", candidate=candidate
         )
+
+    def _write_tags(self, track: Track, path: Path) -> str:
+        """Write the ID3 tags of ``track`` onto ``path``.
+
+        Returns an empty string on success and a short note when tagging
+        failed. The audio file itself is untouched and still playable, so a
+        tagging failure never downgrades the track to ``error``.
+        """
+        if self.tagger is None or not getattr(self.tagger, "available", True):
+            return ""
+        tags = self.tag_map.get(track.key)
+        if tags is None or tags.is_empty:
+            return ""
+        self._report("writing ID3 tags")
+        try:
+            self.tagger.tag(path, tags)
+        except Exception as exc:  # never let tagging disturb the download
+            self._report(f"tag write failed: {exc}", milestone=True)
+            return f"tag write failed: {exc}"
+        return ""
+
+    def tag_existing(self, tracks: Iterable[Track]) -> tuple[int, int, int, int]:
+        """Tag the files of ``tracks`` that are already in the library.
+
+        Used by ``--tag-only``: no searching and no downloading, so it works
+        completely offline. Returns ``(tagged, already, missing, failed)``.
+        Duplicate CSV rows share one file and are therefore counted once.
+        """
+        tagged = already = missing = failed = 0
+        seen: set[Path] = set()
+        for track in tracks:
+            path = self.library.existing(track)
+            if path is None:
+                missing += 1
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            tags = self.tag_map.get(track.key)
+            if tags is None:
+                continue
+            if tags.is_empty:
+                continue
+            if self.dry_run:
+                # Read the current tags but never rewrite the file.
+                probe = getattr(self.tagger, "ffprobe", None) if self.tagger else None
+                current = read_tags(path, probe) if self.tagger else {}
+                wanted = tags.as_metadata()
+                if current and all(current.get(k) == v for k, v in wanted.items()):
+                    already += 1
+                else:
+                    tagged += 1
+                continue
+            outcome = self.tagger.tag_file(path, tags) if self.tagger else "failed"
+            if outcome == "tagged":
+                tagged += 1
+            elif outcome == "already-tagged":
+                already += 1
+            else:
+                failed += 1
+        return tagged, already, missing, failed
 
     def run(self, tracks: Iterable[Track], progress: bool = True) -> Stats:
         tracks = list(tracks)
@@ -1298,6 +1718,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="only process the first N tracks (useful for testing)",
     )
     parser.add_argument(
+        "--no-tags",
+        action="store_true",
+        help="do not write ID3 tags onto the downloaded MP3s",
+    )
+    parser.add_argument(
+        "--tag-only",
+        action="store_true",
+        help="only write ID3 tags for files already in --music-dir; "
+        "nothing is searched or downloaded (works offline)",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="do not print per-track progress",
@@ -1316,6 +1747,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not tracks:
         print(f"error: no usable rows found in {args.csv}", file=sys.stderr)
         return 2
+    # Tags are derived from the full CSV, so album track numbers stay right
+    # even when --limit only processes a slice of it.
+    tag_map = build_tags(tracks)
     if args.limit:
         tracks = tracks[: args.limit]
 
@@ -1347,6 +1781,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         ffmpeg_location=args.ffmpeg_location,
         status=status_fn,
     )
+    tagger: Optional[TagWriter] = None
+    if not args.no_tags:
+        tagger = TagWriter(ffmpeg_location=args.ffmpeg_location, status=status_fn)
+        if not tagger.available:
+            print(
+                "warning: ffmpeg not found, ID3 tags will not be written "
+                "(use --ffmpeg-location to point at it)",
+                file=sys.stderr,
+            )
+
+    # -- tag-only mode: no search, no download, works offline ---------------
+    if args.tag_only:
+        pirater = PlaylistPirater(
+            library=library,
+            finder=None,  # type: ignore[arg-type] -- unused in this mode
+            downloader=None,  # type: ignore[arg-type] -- unused in this mode
+            dry_run=args.dry_run,
+            tagger=tagger,
+            tag_map=tag_map,
+        )
+        print(f"Tagging existing files in {library.root}\n", flush=True)
+        tagged, already, missing, failed = pirater.tag_existing(tracks)
+        if args.dry_run:
+            # A dry run previews the work and never fails: it did nothing.
+            print(
+                f"\nDry run. would-tag={tagged} already-tagged={already} "
+                f"missing={missing} failed={failed}",
+                flush=True,
+            )
+            return 0
+        print(
+            f"\nDone. tagged={tagged} already-tagged={already} "
+            f"missing={missing} failed={failed}",
+            flush=True,
+        )
+        return 1 if (failed or missing) else 0
 
     def on_ready(track: Track, path: Path) -> None:
         """Add a finished track to the playlist and flush it to disk."""
@@ -1364,6 +1834,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         retries=args.retries,
         status=status if not args.quiet else None,
         on_ready=on_ready if writer is not None else None,
+        tagger=tagger,
+        tag_map=tag_map,
     )
 
     # Every audio file that is already in the library goes into the playlist

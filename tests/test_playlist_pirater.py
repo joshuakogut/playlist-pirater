@@ -6,6 +6,7 @@ Run with:  python3 -m unittest discover -s tests -v
 
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1116,3 +1117,669 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuildTagsTests(unittest.TestCase):
+    """The CSV drives the tags; album numbers are recomputed per album."""
+
+    @staticmethod
+    def _tracks(rows):
+        return [
+            pp.Track(artist=a, title=t, album=al, position=p, row=p)
+            for p, a, t, al in rows
+        ]
+
+    def test_writes_title_artist_album_and_album_artist(self):
+        tracks = self._tracks([(1, "A", "T", "Al")])
+        got = pp.build_tags(tracks)[tracks[0].key]
+        self.assertEqual(got.title, "T")
+        self.assertEqual(got.artist, "A")
+        self.assertEqual(got.album, "Al")
+        self.assertEqual(got.album_artist, "A")
+
+    def test_track_number_is_album_relative_not_playlist_position(self):
+        tracks = self._tracks(
+            [(1, "A", "Song 1", "Album"),
+             (2, "B", "Other", "Else"),
+             (13, "A", "Song 2", "Album")]
+        )
+        tags = pp.build_tags(tracks)
+        self.assertEqual(tags[tracks[0].key].track, "1/2")
+        self.assertEqual(tags[tracks[2].key].track, "2/2")
+        # The other album is numbered independently.
+        self.assertEqual(tags[tracks[1].key].track, "1/1")
+
+    def test_track_number_is_case_insensitive_on_album(self):
+        tracks = self._tracks(
+            [(1, "A", "Song 1", "Album"), (2, "A", "Song 2", "ALBUM")]
+        )
+        tags = pp.build_tags(tracks)
+        self.assertEqual(tags[tracks[0].key].track, "1/2")
+        self.assertEqual(tags[tracks[1].key].track, "2/2")
+
+    def test_same_album_by_different_primary_artists_stays_separate(self):
+        tracks = self._tracks(
+            [(1, "A", "Song 1", "Album"), (2, "B", "Song 2", "Album")]
+        )
+        tags = pp.build_tags(tracks)
+        self.assertEqual(tags[tracks[0].key].track, "1/1")
+        self.assertEqual(tags[tracks[1].key].track, "1/1")
+
+    def test_album_artist_is_the_first_artist_of_a_credit(self):
+        tracks = self._tracks([(1, "A, B, C", "Song", "Album")])
+        got = pp.build_tags(tracks)[tracks[0].key]
+        self.assertEqual(got.album_artist, "A")
+        self.assertEqual(got.artist, "A, B, C")
+
+    def test_collaborators_do_not_split_the_album_group(self):
+        """Same album, different featured artists -> still one album."""
+        tracks = self._tracks(
+            [(1, "A", "Song 1", "Album"), (2, "A, X", "Song 2", "Album")]
+        )
+        tags = pp.build_tags(tracks)
+        self.assertEqual(tags[tracks[0].key].track, "1/2")
+        self.assertEqual(tags[tracks[1].key].track, "2/2")
+        self.assertEqual(tags[tracks[0].key].album_artist, "A")
+        self.assertEqual(tags[tracks[1].key].album_artist, "A")
+
+    def test_duplicate_row_shares_one_track_number_and_one_tags_entry(self):
+        tracks = self._tracks(
+            [(1, "A", "Song 1", "Album"),
+             (2, "A", "Song 2", "Album"),
+             (3, "A", "Song 1", "Album")]
+        )
+        tags = pp.build_tags(tracks)
+        self.assertEqual(len(tags), 2)
+        # The duplicate row is dropped, so the numbering is not pushed up.
+        self.assertEqual(tags[tracks[0].key].track, "1/2")
+        self.assertEqual(tags[tracks[1].key].track, "2/2")
+        # The duplicate maps to the very same tag object.
+        self.assertIs(tags[tracks[2].key], tags[tracks[0].key])
+
+    def test_track_without_album_has_no_album_frames(self):
+        tracks = self._tracks([(1, "A", "Song", "")])
+        got = pp.build_tags(tracks)[tracks[0].key]
+        self.assertEqual(got.album, "")
+        self.assertEqual(got.track, "")
+        self.assertEqual(got.disc, "")
+        self.assertEqual(got.title, "Song")
+        self.assertEqual(got.artist, "A")
+
+    def test_disc_is_written_only_for_album_tracks(self):
+        with_album = pp.build_tags(self._tracks([(1, "A", "S", "Al")]))
+        without = pp.build_tags(self._tracks([(1, "A", "S", "")]))
+        self.assertEqual(next(iter(with_album.values())).disc, "1/1")
+        self.assertEqual(next(iter(without.values())).disc, "")
+
+    def test_date_comes_from_the_csv_column(self):
+        tracks = [pp.Track(artist="A", title="T", album="Al", date="1999")]
+        self.assertEqual(pp.build_tags(tracks)[tracks[0].key].date, "1999")
+
+    def test_example_csv_yields_one_tag_set_per_unique_track(self):
+        example = Path(__file__).resolve().parents[1] / "example.csv"
+        if not example.is_file():
+            self.skipTest("example.csv not shipped")
+        tracks = pp.load_tracks(example)
+        tags = pp.build_tags(tracks)
+        self.assertLess(len(tags), len(tracks))  # duplicates collapsed
+        self.assertGreater(len(tags), 1)
+        ember = [t for t in tracks if t.title == "Ember"]
+        self.assertEqual(tags[ember[0].key].album, "Jackpot Juicer")
+        self.assertEqual(tags[ember[0].key].album_artist, "Dance Gavin Dance")
+
+
+class TrackTagsTests(unittest.TestCase):
+    def test_empty_values_are_left_out_of_the_command(self):
+        tags = pp.TrackTags(title="T", artist="A")
+        self.assertEqual(tags.as_metadata(), {"title": "T", "artist": "A"})
+
+    def test_all_frames_are_present_when_set(self):
+        tags = pp.TrackTags(
+            title="T", artist="A", album="Al", album_artist="A",
+            track="1/2", disc="1/1", date="1999",
+        )
+        self.assertEqual(
+            set(tags.as_metadata()),
+            {"title", "artist", "album", "album_artist", "track", "disc", "date"},
+        )
+
+    def test_is_empty(self):
+        self.assertTrue(pp.TrackTags().is_empty)
+        self.assertFalse(pp.TrackTags(title="T").is_empty)
+
+    def test_primary_artist_takes_the_first_name(self):
+        self.assertEqual(pp.primary_artist("A, B"), "A")
+        self.assertEqual(pp.primary_artist("A"), "A")
+        self.assertEqual(pp.primary_artist("  A , B "), "A")
+
+
+class TagCommandTests(unittest.TestCase):
+    """The ffmpeg argv must remux, never re-encode, and never hit a shell."""
+
+    def setUp(self):
+        self.writer = pp.TagWriter()
+        if not self.writer.available:
+            self.skipTest("ffmpeg not installed")
+        self.tags = pp.TrackTags(
+            title="Ember", artist="Dance Gavin Dance", album="Jackpot Juicer",
+            album_artist="Dance Gavin Dance", track="1/7", disc="1/1",
+        )
+
+    def test_copies_streams_without_re_encoding(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertNotIn("-b:a", cmd)
+        self.assertNotIn("-codec:a", cmd)
+
+    def test_maps_every_input_stream_so_cover_art_survives(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        self.assertEqual(cmd[cmd.index("-map") + 1], "0")
+
+    def test_clears_old_metadata_and_chapters_first(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        self.assertEqual(cmd[cmd.index("-map_metadata") + 1], "-1")
+        self.assertEqual(cmd[cmd.index("-map_chapters") + 1], "-1")
+
+    def test_writes_id3v23_without_id3v1(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        self.assertEqual(cmd[cmd.index("-id3v2_version") + 1], "3")
+        self.assertEqual(cmd[cmd.index("-write_id3v1") + 1], "0")
+
+    def test_all_frames_are_passed_as_separate_metadata_args(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-metadata"]
+        self.assertIn("title=Ember", pairs)
+        self.assertIn("album=Jackpot Juicer", pairs)
+        self.assertIn("album_artist=Dance Gavin Dance", pairs)
+        self.assertIn("track=1/7", pairs)
+        self.assertIn("disc=1/1", pairs)
+        self.assertEqual(len(pairs), len(self.tags.as_metadata()))
+
+    def test_metadata_is_never_passed_through_a_shell(self):
+        """Values must be argv entries, not part of one big string."""
+        nasty = pp.TrackTags(title='a; rm -rf / "b" $(c) & d', artist="A")
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), nasty)
+        # The whole value arrives as one argv element, after -metadata.
+        element = 'title=a; rm -rf / "b" $(c) & d'
+        self.assertIn(element, cmd)
+        self.assertEqual(cmd[cmd.index(element) - 1], "-metadata")
+        self.assertEqual(cmd[0], str(self.writer.ffmpeg))
+
+    def test_destination_is_the_last_argument(self):
+        cmd = self.writer.command(Path("in.mp3"), Path("out.mp3"), self.tags)
+        self.assertEqual(cmd[-1], "out.mp3")
+
+    def test_without_ffmpeg_it_reports_unavailable(self):
+        writer = pp.TagWriter(ffmpeg_location="/nonexistent/ffmpeg")
+        # resolve_tool falls back to PATH, so this may still be available;
+        # force it either way to assert the failure path.
+        writer.ffmpeg = None
+        self.assertFalse(writer.available)
+        with self.assertRaises(pp.TagError):
+            writer.tag(Path("x.mp3"), self.tags)
+
+
+class TagWriterTests(unittest.TestCase):
+    """Round-trip tests against a real MP3 generated with ffmpeg."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ffmpeg = pp.resolve_tool("ffmpeg")
+        cls.ffprobe = pp.resolve_tool("ffprobe")
+        if cls.ffmpeg is None or cls.ffprobe is None:
+            raise unittest.SkipTest("ffmpeg/ffprobe not installed")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "Song.mp3"
+        # A short sine wave keeps the tests fast and fully offline.
+        subprocess.run(
+            [
+                str(self.ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+                "-ac", "1", "-ar", "22050", "-b:a", "64k", str(self.path),
+            ],
+            check=True,
+        )
+        self.tags = pp.TrackTags(
+            title="Ember", artist="Dance Gavin Dance", album="Jackpot Juicer",
+            album_artist="Dance Gavin Dance", track="1/7", disc="1/1",
+        )
+        self.writer = pp.TagWriter()
+
+    def audio_fingerprint(self, path):
+        """MD5 of the decoded audio: identical proves no re-encode loss."""
+        out = subprocess.run(
+            [
+                str(self.ffmpeg), "-v", "quiet", "-i", str(path),
+                "-map", "0:a", "-f", "md5", "-",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+
+    def test_writes_every_frame(self):
+        self.assertTrue(self.writer.tag(self.path, self.tags))
+        written = pp.read_tags(self.path, self.ffprobe)
+        self.assertEqual(written["title"], "Ember")
+        self.assertEqual(written["artist"], "Dance Gavin Dance")
+        self.assertEqual(written["album"], "Jackpot Juicer")
+        self.assertEqual(written["album_artist"], "Dance Gavin Dance")
+        self.assertEqual(written["track"], "1/7")
+        self.assertEqual(written["disc"], "1/1")
+
+    def test_audio_is_not_re_encoded(self):
+        before = self.audio_fingerprint(self.path)
+        self.writer.tag(self.path, self.tags)
+        self.assertEqual(self.audio_fingerprint(self.path), before)
+
+    def test_untouched_file_has_no_id3_tags(self):
+        tags = pp.read_tags(self.path, self.ffprobe)
+        # A freshly generated file only carries ffmpeg's own "encoder" mark.
+        ours = {"title", "artist", "album", "album_artist", "track", "disc"}
+        self.assertFalse(ours & set(tags))
+
+    def test_unicode_survives(self):
+        tags = pp.TrackTags(
+            title="Andrés — Sigur Rós (Ágætis byrjun)",
+            artist="Sigur Rós", album="Ágætis byrjun",
+            album_artist="Sigur Rós", track="3/10", disc="1/1",
+        )
+        self.assertTrue(self.writer.tag(self.path, tags))
+        written = pp.read_tags(self.path, self.ffprobe)
+        self.assertEqual(written["title"], "Andrés — Sigur Rós (Ágætis byrjun)")
+        self.assertEqual(written["album"], "Ágætis byrjun")
+
+    def test_special_characters_survive(self):
+        tags = pp.TrackTags(
+            title='He said "hi" & left = stayed\nsecond line',
+            artist="A; B & C", album="O'Brien's 'Album'",
+            album_artist="A", track="1/1", disc="1/1",
+        )
+        self.assertTrue(self.writer.tag(self.path, tags))
+        written = pp.read_tags(self.path, self.ffprobe)
+        self.assertEqual(written["title"], 'He said "hi" & left = stayed\nsecond line')
+        self.assertEqual(written["album"], "O'Brien's 'Album'")
+
+    def test_long_value_is_not_truncated_by_id3v1(self):
+        long_title = "x" * 80
+        tags = pp.TrackTags(title=long_title, artist="A", album="B",
+                            album_artist="A", track="1/1", disc="1/1")
+        self.writer.tag(self.path, tags)
+        written = pp.read_tags(self.path, self.ffprobe)
+        self.assertEqual(written["title"], long_title)
+
+    def test_second_tag_run_is_a_no_op(self):
+        self.assertTrue(self.writer.tag(self.path, self.tags))
+        self.assertFalse(self.writer.tag(self.path, self.tags))
+
+    def test_empty_tags_do_nothing(self):
+        self.assertFalse(self.writer.tag(self.path, pp.TrackTags()))
+
+    def test_no_temporary_file_is_left_behind(self):
+        self.writer.tag(self.path, self.tags)
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()),
+                         ["Song.mp3"])
+
+    def test_failure_leaves_the_original_intact(self):
+        broken = self.path.with_name("Broken.mp3")
+        broken.write_bytes(b"not an mp3")
+        before = broken.read_bytes()
+        with self.assertRaises(pp.TagError):
+            self.writer.tag(broken, self.tags)
+        # The broken file was never replaced and no temp file remains.
+        self.assertEqual(broken.read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()),
+                         ["Broken.mp3", "Song.mp3"])
+
+    def test_tag_file_returns_outcome_instead_of_raising(self):
+        self.assertEqual(self.writer.tag_file(self.path, self.tags), "tagged")
+        self.assertEqual(self.writer.tag_file(self.path, self.tags), "already-tagged")
+
+    def test_tag_file_reports_missing_ffmpeg(self):
+        writer = pp.TagWriter()
+        writer.ffmpeg = None
+        self.assertEqual(writer.tag_file(self.path, self.tags), "failed")
+
+
+class CoverArtTests(unittest.TestCase):
+    """An embedded cover must survive the remux."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ffmpeg = pp.resolve_tool("ffmpeg")
+        cls.ffprobe = pp.resolve_tool("ffprobe")
+        if cls.ffmpeg is None or cls.ffprobe is None:
+            raise unittest.SkipTest("ffmpeg/ffprobe not installed")
+
+    def test_attached_picture_stream_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "c.png"
+            subprocess.run(
+                [str(self.ffmpeg), "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=red:s=16x16", "-frames:v", "1", str(png)],
+                check=True,
+            )
+            mp3 = Path(tmp) / "Song.mp3"
+            subprocess.run(
+                [str(self.ffmpeg), "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=440:duration=0.3", "-i", str(png),
+                 "-map", "0:a", "-map", "1:v",
+                 "-c:a", "libmp3lame", "-c:v", "png",
+                 "-disposition:v", "attached_pic",
+                 "-id3v2_version", "3", str(mp3)],
+                check=True,
+            )
+            before = self._stream_count(mp3)
+            writer = pp.TagWriter()
+            writer.tag(mp3, pp.TrackTags(title="T", artist="A", album="Al",
+                                         album_artist="A", track="1/1", disc="1/1"))
+            after = self._stream_count(mp3)
+            self.assertEqual(after, before)
+            self.assertGreaterEqual(after, 2)  # audio + picture
+
+    def _stream_count(self, path):
+        out = subprocess.run(
+            [str(self.ffprobe), "-v", "error", "-show_entries", "stream=index",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        return len([line for line in out.stdout.splitlines() if line.strip()])
+
+
+class PipelineTaggingTests(unittest.TestCase):
+    """Tagging is wired into the download path without changing its status."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.music = Path(self.tmp.name) / "music"
+        self.music.mkdir()
+        self.track = pp.Track(artist="A", title="B", album="Album")
+        self.tag_map = pp.build_tags([self.track])
+
+    @staticmethod
+    def _finder():
+        class Finder:
+            def find(self, track):
+                return pp.Candidate(video_id="4ZYsNXDJrZ4", title="B", artist="A")
+
+        return Finder()
+
+    @staticmethod
+    def _downloader():
+        class Downloader:
+            def download(self, candidate, destination):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.with_suffix(".mp3").write_bytes(b"audio" * 100)
+                return destination.with_suffix(".mp3")
+
+        return Downloader()
+
+    def _pirater(self, tagger=None, **kwargs):
+        return pp.PlaylistPirater(
+            library=pp.MusicLibrary(self.music),
+            finder=self._finder(),
+            downloader=self._downloader(),
+            tagger=tagger,
+            tag_map=self.tag_map,
+            **kwargs,
+        )
+
+    def test_tags_are_written_after_a_successful_download(self):
+        calls = []
+
+        class FakeTagger:
+            def tag(self, path, tags):
+                calls.append((path, tags))
+                return True
+
+        result = self._pirater(FakeTagger()).process(self.track)
+        self.assertEqual(result.status, "downloaded")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], result.path)
+        self.assertEqual(calls[0][1].title, "B")
+        self.assertEqual(calls[0][1].track, "1/1")
+
+    def test_no_tagger_leaves_the_track_untouched(self):
+        result = self._pirater().process(self.track)
+        self.assertEqual(result.status, "downloaded")
+        self.assertTrue(result.ok)
+
+    def test_tag_failure_does_not_fail_the_track(self):
+        class FailingTagger:
+            def tag(self, path, tags):
+                raise pp.TagError("boom")
+
+        result = self._pirater(FailingTagger()).process(self.track)
+        self.assertEqual(result.status, "downloaded")
+        self.assertIn("tag write failed: boom", result.message)
+        self.assertIsNotNone(result.path)
+        self.assertTrue(result.path.exists())
+
+    def test_tag_failure_is_not_retried(self):
+        attempts = {"downloads": 0, "tags": 0}
+
+        class CountingDownloader:
+            def download(self, candidate, destination):
+                attempts["downloads"] += 1
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.with_suffix(".mp3").write_bytes(b"audio" * 100)
+                return destination.with_suffix(".mp3")
+
+        class FailingTagger:
+            def tag(self, path, tags):
+                attempts["tags"] += 1
+                raise pp.TagError("boom")
+
+        pirater = pp.PlaylistPirater(
+            library=pp.MusicLibrary(self.music),
+            finder=self._finder(),
+            downloader=CountingDownloader(),
+            tagger=FailingTagger(),
+            tag_map=self.tag_map,
+        )
+        result = pirater.process(self.track)
+        self.assertEqual(result.status, "downloaded")
+        self.assertEqual(attempts["downloads"], 1)
+        self.assertEqual(attempts["tags"], 1)
+
+    def test_skipped_track_is_topped_up_with_tags(self):
+        """A file that predates tagging gets its tags on a plain re-run."""
+        (self.music / "A - B.mp3").write_bytes(b"x" * 10)
+
+        class Finder:
+            def find(self, track):
+                raise AssertionError("should not search")
+
+        calls = []
+
+        class Tagger:
+            def tag(self, path, tags):
+                calls.append(path)
+                return True
+
+        pirater = pp.PlaylistPirater(
+            library=pp.MusicLibrary(self.music),
+            finder=Finder(), downloader=None,
+            tagger=Tagger(), tag_map=self.tag_map,
+        )
+        result = pirater.process(self.track)
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.path, calls[0])
+
+    def test_skipped_track_without_tags_still_reports_skipped(self):
+        (self.music / "A - B.mp3").write_bytes(b"x" * 10)
+
+        class Finder:
+            def find(self, track):
+                raise AssertionError("should not search")
+
+        class FailingTagger:
+            def tag(self, path, tags):
+                raise pp.TagError("boom")
+
+        pirater = pp.PlaylistPirater(
+            library=pp.MusicLibrary(self.music),
+            finder=Finder(), downloader=None,
+            tagger=FailingTagger(), tag_map=self.tag_map,
+        )
+        result = pirater.process(self.track)
+        self.assertEqual(result.status, "skipped")
+        self.assertTrue(result.ok)
+        self.assertIn("tag write failed: boom", result.message)
+
+    def test_track_not_in_the_tag_map_is_not_tagged(self):
+        class UnexpectedTagger:
+            def tag(self, path, tags):
+                raise AssertionError("no tags for this track")
+
+        pirater = pp.PlaylistPirater(
+            library=pp.MusicLibrary(self.music),
+            finder=self._finder(), downloader=self._downloader(),
+            tagger=UnexpectedTagger(), tag_map={},
+        )
+        result = pirater.process(self.track)
+        self.assertEqual(result.status, "downloaded")
+
+    def test_tagger_receives_the_progress_prefix(self):
+        seen = []
+
+        class FakeTagger:
+            prefix = ""
+
+            def tag(self, path, tags):
+                seen.append(self.prefix)
+                return True
+
+        self._pirater(FakeTagger()).run([self.track], progress=False)
+        self.assertEqual(seen, ["[1/1]"])
+
+
+class TagExistingTests(unittest.TestCase):
+    """The --tag-only pass over an already-populated music directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.music = Path(self.tmp.name) / "music"
+        self.music.mkdir()
+
+    def _pirater(self, tracks, tagger=None, library=None):
+        return pp.PlaylistPirater(
+            library=library or pp.MusicLibrary(self.music),
+            finder=None, downloader=None,
+            tagger=tagger, tag_map=pp.build_tags(tracks),
+        )
+
+    def test_counts_tagged_already_missing_and_failed(self):
+        tracks = [
+            pp.Track(artist="A", title="One", album="Al"),
+            pp.Track(artist="A", title="Two", album="Al"),
+            pp.Track(artist="C", title="Gone", album="Al"),
+        ]
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+        (self.music / "A - Two.mp3").write_bytes(b"x" * 10)
+
+        class Tagger:
+            def tag_file(self, path, tags):
+                return "already-tagged"
+
+        counts = self._pirater(tracks, Tagger()).tag_existing(tracks)
+        self.assertEqual(counts, (0, 2, 1, 0))
+
+    def test_tagged_counts_and_missing_files(self):
+        tracks = [pp.Track(artist="A", title="One", album="Al")]
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+
+        class Tagger:
+            def tag_file(self, path, tags):
+                return "tagged"
+
+        counts = self._pirater(tracks, Tagger()).tag_existing(tracks)
+        self.assertEqual(counts, (1, 0, 0, 0))
+
+    def test_duplicate_rows_count_the_file_once(self):
+        tracks = [
+            pp.Track(artist="A", title="One", album="Al"),
+            pp.Track(artist="A", title="One", album="Al"),
+        ]
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+        seen = []
+
+        class Tagger:
+            def tag_file(self, path, tags):
+                seen.append(path)
+                return "tagged"
+
+        counts = self._pirater(tracks, Tagger()).tag_existing(tracks)
+        self.assertEqual(counts, (1, 0, 0, 0))
+        self.assertEqual(len(seen), 1)
+
+    def test_without_a_tagger_everything_counts_as_failed(self):
+        tracks = [pp.Track(artist="A", title="One", album="Al")]
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+        counts = self._pirater(tracks, tagger=None).tag_existing(tracks)
+        self.assertEqual(counts, (0, 0, 0, 1))
+
+
+class TagOnlyCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.csv = self.root / "p.csv"
+        self.csv.write_text(
+            "position,artist,title,album\n"
+            "1,A,One,Al\n"
+            "2,A,Two,Al\n",
+            encoding="utf-8",
+        )
+        self.music = self.root / "music"
+        self.music.mkdir()
+
+    def _run(self, extra=()):
+        argv = [
+            str(self.csv), "--music-dir", str(self.music),
+            "--m3u-playlist-dir", str(self.root / "pl"),
+            "--no-m3u-playlist", "--quiet", "--tag-only",
+            *extra,
+        ]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = pp.main(argv)
+        return code, out.getvalue()
+
+    def test_tag_only_flags_are_parsed(self):
+        args = pp.build_parser().parse_args(["a.csv", "--tag-only"])
+        self.assertTrue(args.tag_only)
+        self.assertFalse(args.no_tags)
+
+    def test_dry_run_tag_only_does_not_write(self):
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+        code, out = self._run(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("missing=1", out)
+
+    def test_tag_only_reports_missing_files(self):
+        code, out = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("missing=2", out)
+
+    def test_tag_only_no_tags_flag_skips_tagger(self):
+        (self.music / "A - One.mp3").write_bytes(b"x" * 10)
+        code, out = self._run(["--no-tags"])
+        # Without a tagger every present file counts as failed.
+        self.assertIn("failed=1", out)
+        self.assertEqual(code, 1)
+
+    def test_limit_does_not_change_album_numbers(self):
+        """--limit slices the run but the tag map comes from the full CSV."""
+        tracks = pp.load_tracks(self.csv)
+        tags = pp.build_tags(tracks)
+        self.assertEqual(len(tags), 2)
+        self.assertEqual(tags[tracks[0].key].track, "1/2")
+        self.assertEqual(tags[tracks[1].key].track, "2/2")

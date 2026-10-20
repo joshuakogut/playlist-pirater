@@ -13,6 +13,9 @@ Turns a playlist CSV into a local MP3 library using YouTube Music.
    the download starts — containing every audio file that is already in the
    library — and is then updated after every finished track, so it grows
    while the download is still running.
+5. **Tag the MP3** with the ID3 metadata from the CSV (artist, title, album,
+   album artist, track and disc number) using ffmpeg — the audio is copied,
+   never re-encoded. See [ID3 tags](#id3-tags).
 
 Matching is done on **artist + title only** — live versions, remasters,
 instrumentals and covers are deliberately ignored, as the plan requires.
@@ -34,6 +37,12 @@ python3 playlist_pirater.py example.csv --music-dir music --dry-run
 
 # Just the first 10 tracks, with a CSV report of the run
 python3 playlist_pirater.py example.csv --music-dir music --limit 10 --report report.csv
+
+# Tag files that are already in ./music, without downloading anything
+python3 playlist_pirater.py example.csv --music-dir music --tag-only
+
+# Preview that tag-only pass first
+python3 playlist_pirater.py example.csv --music-dir music --tag-only --dry-run
 ```
 
 Re-running the same command is safe: tracks that are already present in the
@@ -85,10 +94,13 @@ Use `--quiet` to suppress both.
 | `--retries` | `2` | Retries per failed download. |
 | `--ffmpeg-location` | PATH | Explicit path to the ffmpeg binary. |
 | `--limit` | – | Only process the first N tracks. |
+| `--no-tags` | off | Do not write ID3 tags onto the downloaded MP3s. |
+| `--tag-only` | off | Only write ID3 tags for files already in `--music-dir`; nothing is searched or downloaded, so it works offline. |
 | `--quiet` | off | Suppress the per-track log and the live status line. |
 
-Exit code is `0` when no errors occurred, `1` when one or more tracks failed,
-and `2` for usage problems (missing/invalid CSV).
+Exit code is `0` when no errors occurred, `1` when one or more tracks failed
+(with `--tag-only`: when any file was missing or could not be tagged), and
+`2` for usage problems (missing/invalid CSV).
 
 ## M3U playlist
 
@@ -162,11 +174,67 @@ python3 playlist_pirater.py example.csv \
     --m3u-playlist-dir /home/joshua/projects/playlist-pirater/playlists
 ```
 
+## ID3 tags
+
+Every downloaded MP3 gets ID3 metadata taken from the playlist CSV, written
+with `ffmpeg` as a **stream copy** (`-c copy`): the audio frames are moved
+unchanged, nothing is re-encoded, and attached cover art survives the remux.
+
+| ID3 frame | Source |
+| --- | --- |
+| `title` | `title` column |
+| `artist` (TPE1) | `artist` column, exactly as written (collaborators kept) |
+| `album` (TALB) | `album` column |
+| `album artist` (TPE2) | the first artist of the credit, so the album groups correctly in players |
+| `track` (TRCK) | recomputed **inside the album** (`3/12`), not the playlist position |
+| `disc` (TPOS) | `1/1` for album tracks |
+| `date` (TYER) | optional `year`/`date` column, when the CSV has one |
+
+Notes:
+
+* **Track numbers are album-relative.** The CSV `position` column is the order
+  of the playlist, so it is not used for the tags; rows are grouped by
+  `(album, primary artist)` and numbered `1..N` within the group, in CSV order.
+* **A track that appears twice in the CSV** (or twice on the same album) is
+  downloaded once and gets one set of tags, so duplicates never get
+  conflicting track numbers.
+* Tags are written as **ID3v2.3** without an ID3v1 block, because ID3v1 would
+  truncate long and non-ASCII values. Unicode in artist/title/album is stored
+  correctly.
+* **Old tags are cleared first** (`-map_metadata -1`), so whatever yt-dlp
+  left behind cannot survive next to the new frames.
+* Tags are written to a temporary file in the same directory and then moved
+  into place, so an interrupted run never leaves a half-written MP3.
+* Nothing is fetched from the network for tagging — an album's year can only
+  come from the CSV.
+
+### Tag files that are already downloaded
+
+Tagging does not touch the network, so it can be run on its own over an
+existing library:
+
+```bash
+# Write tags for everything already in ./music
+python3 playlist_pirater.py example.csv --music-dir music --tag-only
+
+# See what would change first
+python3 playlist_pirater.py example.csv --music-dir music --tag-only --dry-run
+```
+
+The summary reports `tagged` (the file was rewritten), `already-tagged`
+(matching tags were already present, so the file was left alone), `missing`
+(a CSV track with no file) and `failed`. The exit code is `1` if anything was
+missing or failed.
+
+Re-tagging is idempotent: files that already carry the requested tags are
+left untouched, so running `--tag-only` again costs nothing.
+
 ## CSV format
 
-The `artist` and `title` columns are required; `album` and `position` are
-optional and only used for reporting. A two-column `Artist - Title` file also
-works.
+The `artist` and `title` columns are required. `album` and `position` are
+optional, and `album` is what the ID3 tags are built from. An optional
+`year`/`date` column supplies the release year. A two-column
+`Artist - Title` file also works.
 
 ```csv
 position,artist,title,album,track_uri
@@ -179,7 +247,10 @@ position,artist,title,album,track_uri
 python3 -m unittest discover -s tests -v
 ```
 
-The tests are fully offline — network access is stubbed out.
+The tests are fully offline — network access is stubbed out. The tagging
+tests build a short MP3 with `ffmpeg -f lavfi -i sine=...` and verify the
+result with `ffprobe`; they are skipped automatically when ffmpeg is not
+installed.
 
 ## Notes and limitations
 
@@ -192,3 +263,7 @@ The tests are fully offline — network access is stubbed out.
   is not on YouTube Music, a matching upload by another channel may be used.
 * Files are named `Artist - Title.mp3`; illegal filename characters are
   replaced with `_`.
+* Tags come only from the CSV: there is no Spotify/MusicBrainz lookup, so a
+  release year is written only when the CSV provides one, and multi-artist
+  credits are stored verbatim with the first name used as the album artist.
+* `disc` is always `1/1` because the CSV carries no disc information.
